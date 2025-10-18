@@ -1,4 +1,4 @@
-# Editable install for local development
+--extra-index-url https://download.pytorch.org/whl/cpu
 -e .
 cycler>=0.11
 kiwisolver>=1.4.5
@@ -10,8 +10,5 @@ python-dateutil>=2.8.2
 pytz>=2023.3
 six>=1.16
 tqdm>=4.66
-# Install the base CPU wheel by default; select the appropriate CUDA-specific
-# extra index URL and build tag (e.g. torch==2.4.1+cu121) when running on a GPU
-# enabled runtime.
-torch==2.4.1
+torch==2.4.1+cpu
 gymnasium>=0.29
