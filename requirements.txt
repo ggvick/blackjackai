@@ -1,11 +1,17 @@
--e git+https://github.com/ellisandrews/blackjack.git@a631af82e0a583efd5b0b1a68db9f54f8d7db782#egg=Blackjack
-cycler==0.10.0
-kiwisolver==1.2.0
-matplotlib==3.2.2
-numpy==1.19.0
-pandas==1.0.5
-pyparsing==2.4.7
-python-dateutil==2.8.1
-pytz==2020.1
-six==1.15.0
-tqdm==4.47.0
+# Editable install for local development
+-e .
+cycler>=0.11
+kiwisolver>=1.4.5
+matplotlib>=3.7
+numpy>=1.23
+pandas>=1.5
+pyparsing>=3.0
+python-dateutil>=2.8.2
+pytz>=2023.3
+six>=1.16
+tqdm>=4.66
+# Install the base CPU wheel by default; select the appropriate CUDA-specific
+# extra index URL and build tag (e.g. torch==2.4.1+cu121) when running on a GPU
+# enabled runtime.
+torch==2.4.1
+gymnasium>=0.29
