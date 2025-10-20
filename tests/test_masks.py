@@ -1,66 +1,36 @@
-from blackjackai_rl.env import BlackjackEnv, BlackjackEnvConfig, Card
+from blackjack_env.env import BlackjackEnv, EnvConfig
+from blackjack_env.masking import Action
 
 
-def make_card(rank: str, value: int) -> Card:
-    return Card(rank=rank, value=value, suit="♣")
+def set_cards(env, cards):
+    filler = [2, 3, 4, 5, 6, 7, 8, 9, 10, 1] * 6
+    env.state.shoe = list(reversed(cards + filler))
+    env.state.shoe_initial_count = len(env.state.shoe)
+    env.step({"bet": 0})
 
 
-def rig_deck(env: BlackjackEnv, draw_sequence):
-    env.shoe.cards = [make_card("2", 2) for _ in range(16)]
-    for card in reversed(draw_sequence):
-        env.shoe.cards.append(card)
-
-
-def reset_with_deck(env: BlackjackEnv, draw_sequence):
+def test_action_masks_basic():
+    env = BlackjackEnv(EnvConfig(seed=7))
     env.reset()
-    rig_deck(env, draw_sequence)
+    # Pair for split
+    set_cards(env, [8, 6, 8, 10])
+    mask = env.available_actions()
+    assert mask[Action.SPLIT]
+    assert mask[Action.DOUBLE]
+    assert mask[Action.SURRENDER]
+
+    # After split first hand, double not allowed when more than two cards
+    env.step(Action.SPLIT)
+    env.step(Action.HIT)
+    mask = env.available_actions()
+    assert not mask[Action.DOUBLE]
 
 
-def test_action_mask_allows_split_and_double():
-    config = BlackjackEnvConfig(reward_shaping=False, seed=11)
-    env = BlackjackEnv(config)
-    reset_with_deck(
-        env,
-        [
-            make_card("6", 6),
-            make_card("5", 5),
-            make_card("8", 8),
-            make_card("8", 8),
-        ],
-    )
-    obs, reward, done, info = env.step(0)
-    assert reward == 0.0
-    assert not done
-    mask = info["action_mask"]
-    assert mask.shape == (env.num_actions,)
-    assert mask[env.ACTION_SPLIT] == 1.0
-    assert mask[env.ACTION_DOUBLE] == 1.0
-    assert mask[env.ACTION_STAND] == 1.0
-
-    # After hit, double and split should be disabled
-    obs, reward, done, info = env.step(env.ACTION_HIT)
-    assert not done
-    mask_after_hit = info["action_mask"]
-    assert mask_after_hit[env.ACTION_DOUBLE] == 0.0
-    assert mask_after_hit[env.ACTION_SPLIT] == 0.0
-
-
-def test_mask_blocks_double_when_bankroll_low():
-    config = BlackjackEnvConfig(
-        reward_shaping=False, bankroll=1.0, min_bet=1.0, max_bet=8.0, seed=21
-    )
-    env = BlackjackEnv(config)
-    reset_with_deck(
-        env,
-        [
-            make_card("9", 9),
-            make_card("7", 7),
-            make_card("10", 10),
-            make_card("9", 9),
-        ],
-    )
-    _, reward, done, info = env.step(0)
-    assert reward == 0.0
-    assert not done
-    mask = info["action_mask"]
-    assert mask[env.ACTION_DOUBLE] == 0.0
+def test_double_mask_after_action():
+    env = BlackjackEnv(EnvConfig(seed=11))
+    env.reset()
+    set_cards(env, [6, 5, 5, 10])
+    env.step(Action.DOUBLE)
+    mask = env.available_actions()
+    # After doubling the hand resolves and mask is zero as round complete
+    assert mask.sum() == 0
