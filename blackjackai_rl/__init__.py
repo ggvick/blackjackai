@@ -1,6 +1,15 @@
 """Utilities for training blackjack reinforcement learning agents."""
 
-from . import counting, device, env, strategy, agents, training, evaluation, tests, utils  # noqa: F401
+from . import (
+    counting,
+    device,
+    env,
+    strategy,
+    agents,
+    training,
+    evaluation,
+    utils,
+)  # noqa: F401
 
 __all__ = [
     "counting",
@@ -10,6 +19,5 @@ __all__ = [
     "agents",
     "training",
     "evaluation",
-    "tests",
     "utils",
 ]

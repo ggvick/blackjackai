@@ -1,4 +1,5 @@
 """Device selection utilities for Torch models."""
+
 from __future__ import annotations
 
 import logging
@@ -44,7 +45,9 @@ def detect_torch_device(prefer_cuda: bool = True) -> DeviceConfig:
         LOGGER.info("Using CUDA device %s (%s)", index, name)
         return DeviceConfig(f"cuda:{index}", "float32", True, index)
 
-    if prefer_cuda and torch.backends.mps.is_available():  # pragma: no cover - macOS specific
+    if (
+        prefer_cuda and torch.backends.mps.is_available()
+    ):  # pragma: no cover - macOS specific
         LOGGER.info("Using Apple Metal Performance Shaders (MPS) backend")
         return DeviceConfig("mps", "float32", True, None)
 

@@ -1,4 +1,5 @@
 """Shared helpers for Blackjack RL notebook."""
+
 from __future__ import annotations
 
 import json

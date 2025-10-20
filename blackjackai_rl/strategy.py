@@ -1,4 +1,5 @@
 """Deterministic basic-strategy policy tables."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -88,7 +89,9 @@ def basic_strategy(
                 return BasicStrategyDecision("split", "Pair splitting table")
             if "double" in rules and dealer_upcard in rules["double"]:
                 if can_double:
-                    return BasicStrategyDecision("double", "Treat pair of fives as double")
+                    return BasicStrategyDecision(
+                        "double", "Treat pair of fives as double"
+                    )
                 return BasicStrategyDecision("hit", "Pair double fallback")
             if "stand" in rules and dealer_upcard in rules["stand"]:
                 return BasicStrategyDecision("stand", "Pair standing table")

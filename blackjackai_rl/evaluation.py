@@ -1,119 +1,133 @@
-"""Evaluation and visualization helpers for Blackjack RL."""
+"""Evaluation and reporting utilities for Blackjack agents."""
+
 from __future__ import annotations
 
 import dataclasses
+import json
+import math
+import statistics
+import time
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-from .agents import BasicStrategyAgent, DQNAgent
+from .agents import RainbowDQNAgent
 from .env import BlackjackEnv, BlackjackEnvConfig
-from .training import legal_mask_from_info
-# No direct filesystem helpers required here; plotting functions ensure directories.
+from .hand_logger import DecisionLogger, HandDecision
+from .policies import (
+    BasicStrategyPolicy,
+    CountBettingPolicy,
+    CountBettingSchedule,
+    EvaluationPolicy,
+)
+from .strategy import basic_strategy
+from .utils import ensure_dir
 
 
 @dataclass
-class HandRecord:
-    index: int
-    bankroll_before: float
-    bankroll_after: float
-    bet: float
-    delta: float
-    reward: float
-    outcome: str
-    true_count: float
-    running_count: float
-    action: str
-    decks_remaining: float
-
-
-@dataclass
-class EvaluationSummary:
+class EvaluationMetrics:
+    ev_per_100: float
+    ev_confidence: Tuple[float, float]
     win_rate: float
-    expected_value: float
+    push_rate: float
+    loss_rate: float
+    bust_rate: float
     total_hands: int
     bankroll_change: float
-    episodes_played: int
-    average_bet: float
+    action_frequencies: Dict[str, float]
+    bet_by_true_count: Dict[str, float]
+    outcome_by_true_count: Dict[str, float]
+    baselines: Dict[str, Dict[str, float]]
+
+    def to_dict(self) -> Dict[str, object]:
+        return dataclasses.asdict(self)
 
 
-def evaluate_policy(
-    env_config: BlackjackEnvConfig,
-    action_fn: Callable[[np.ndarray, Sequence[int], Dict[str, float | str], BlackjackEnv], int],
-    num_hands: int = 2_000,
-    seed: int | None = None,
-) -> Dict[str, object]:
-    """Run evaluation episodes and collect rich telemetry."""
+def _timestamp_dir(base: str | Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = ensure_dir(Path(base) / stamp)
+    ensure_dir(path / "plots")
+    ensure_dir(path / "logs")
+    return path
 
-    config = dataclasses.replace(env_config)
-    config.reward_shaping = False
-    config.seed = seed
-    env = BlackjackEnv(config)
-    obs, info = env.reset()
-    hand_records: List[HandRecord] = []
-    bankroll_before = env.bankroll
-    hands_played = 0
-    episode_returns: List[float] = []
-    session_return = 0.0
 
-    while hands_played < num_hands:
-        legal_actions = info.get("legal_actions") or env.valid_actions(env.active_hands[env.current_hand_index])
-        mask = legal_actions if isinstance(legal_actions, Sequence) else env.valid_actions(env.active_hands[env.current_hand_index])
-        action = action_fn(obs, mask, info, env)
-        obs, reward, done, info = env.step(action)
-        session_return += reward
-        if info.get("hand_complete"):
-            hand_records.append(
-                HandRecord(
-                    index=hands_played,
-                    bankroll_before=bankroll_before,
-                    bankroll_after=float(info.get("bankroll", env.bankroll)),
-                    bet=float(info.get("bet", env.config.min_bet)),
-                    delta=float(info.get("delta", reward)),
-                    reward=float(reward),
-                    outcome=str(info.get("outcome", "")),
-                    true_count=float(info.get("true_count", 0.0)),
-                    running_count=float(info.get("running_count", 0.0)),
-                    action=env.action_names.get(action, ""),
-                    decks_remaining=float(env.counter.decks_remaining),
-                )
+def _compute_confidence_interval(values: Sequence[float]) -> Tuple[float, float]:
+    if not values:
+        return (0.0, 0.0)
+    if len(values) == 1:
+        return (values[0], values[0])
+    mean = statistics.mean(values)
+    stdev = statistics.stdev(values)
+    margin = 1.96 * stdev / math.sqrt(len(values))
+    return (mean - margin, mean + margin)
+
+
+def _prepare_hand_record(
+    env: BlackjackEnv,
+    info: Dict[str, object],
+    bet_index: int,
+    bet_q_values: Sequence[float],
+    bankroll_before: float,
+) -> HandDecision:
+    return HandDecision(
+        episode_id=int(info.get("episode_id", env.episode_id)),
+        shoe_id=int(info.get("shoe_id", env.shoe_id)),
+        hand_id=int(info.get("hand_id", env.current_hand_index)),
+        bet_index=bet_index,
+        bet_amount=float(info.get("current_bet", env.last_bet)),
+        bet_q_values=bet_q_values,
+        bankroll_before=bankroll_before,
+        running_count=float(env.counter.running_count),
+        true_count=float(env.counter.true_count),
+        penetration=float(env.penetration_progress),
+        dealer_upcard=int(
+            info.get(
+                "dealer_upcard", env.dealer_cards[0].value if env.dealer_cards else 0
             )
-            bankroll_before = env.bankroll
-            hands_played += 1
-        if done:
-            episode_returns.append(session_return)
-            session_return = 0.0
-            if hands_played >= num_hands:
-                break
-            obs, info = env.reset()
-            bankroll_before = env.bankroll
-            continue
-
-    bankroll_change = env.bankroll - env.config.bankroll
-    wins = sum(1 for record in hand_records if record.delta > 0)
-    pushes = sum(1 for record in hand_records if np.isclose(record.delta, 0.0))
-    losses = len(hand_records) - wins - pushes
-    win_rate = wins / max(1, len(hand_records))
-    expected_value = np.mean([record.delta for record in hand_records]) if hand_records else 0.0
-    average_bet = np.mean([record.bet for record in hand_records]) if hand_records else 0.0
-
-    summary = EvaluationSummary(
-        win_rate=win_rate,
-        expected_value=expected_value,
-        total_hands=len(hand_records),
-        bankroll_change=bankroll_change,
-        episodes_played=len(episode_returns),
-        average_bet=average_bet,
+        ),
+        player_total=int(info.get("player_total", 0)),
     )
 
-    return {
-        "hand_records": hand_records,
-        "episode_returns": episode_returns,
-        "summary": summary,
-    }
+
+def _basic_strategy_action(env: BlackjackEnv, info: Dict[str, object]) -> str:
+    hand = env.active_hands[env.current_hand_index]
+    legal = env.valid_actions(hand)
+    total, usable_ace = env.hand_total(hand.cards)
+    is_pair, pair_rank = env.is_pair(hand.cards)
+    dealer_upcard = env.dealer_cards[0].value if env.dealer_cards else 0
+    decision = basic_strategy(
+        total,
+        usable_ace,
+        pair_rank,
+        dealer_upcard,
+        env.ACTION_DOUBLE in legal,
+        env.ACTION_SPLIT in legal,
+        env.config.allow_surrender and len(hand.cards) == 2,
+    )
+    return decision.action
+
+
+def _collect_deviation(
+    action: int, env: BlackjackEnv, info: Dict[str, object]
+) -> Optional[str]:
+    recommended = _basic_strategy_action(env, info)
+    chosen = env.action_names.get(action, "")
+    if chosen != recommended:
+        true_count = float(env.counter.true_count)
+        return f"TC {true_count:.1f}: chose {chosen} over basic {recommended}"
+    return None
+
+
+def _bin_true_count(value: float) -> str:
+    if value >= 5:
+        return "5+"
+    if value <= -5:
+        return "-5-"
+    return str(int(math.floor(value)))
 
 
 def _save_plot(path: Path) -> None:
@@ -123,190 +137,299 @@ def _save_plot(path: Path) -> None:
     plt.close()
 
 
-def plot_training_curves(history: Dict[str, List[float]], output_dir: str | Path) -> Dict[str, str]:
-    output_paths: Dict[str, str] = {}
-    rewards = history.get("reward_history", [])
-    losses = history.get("loss_history", [])
-    q_values = history.get("q_history", [])
-    epsilons = history.get("epsilon_history", [])
-    steps = np.arange(len(rewards))
-
-    plt.figure(figsize=(8, 4))
-    plt.plot(steps, rewards, label="Average reward")
-    plt.xlabel("Batch step")
-    plt.ylabel("Reward")
-    plt.title("DQN reward curve")
-    plt.grid(True)
-    plot_path = Path(output_dir) / "plots" / "training_reward_curve.png"
-    _save_plot(plot_path)
-    output_paths["reward_curve"] = str(plot_path)
-
-    if losses:
-        plt.figure(figsize=(8, 4))
-        plt.plot(np.arange(len(losses)), losses, label="Loss", color="tab:red")
-        plt.xlabel("Update step")
-        plt.ylabel("Loss")
-        plt.title("DQN loss curve")
-        plt.grid(True)
-        plot_path = Path(output_dir) / "plots" / "training_loss_curve.png"
-        _save_plot(plot_path)
-        output_paths["loss_curve"] = str(plot_path)
-
-    if q_values:
-        plt.figure(figsize=(8, 4))
-        plt.plot(np.arange(len(q_values)), q_values, label="Q-value", color="tab:green")
-        plt.xlabel("Update step")
-        plt.ylabel("Average Q")
-        plt.title("Estimated Q-values")
-        plt.grid(True)
-        plot_path = Path(output_dir) / "plots" / "training_q_curve.png"
-        _save_plot(plot_path)
-        output_paths["q_curve"] = str(plot_path)
-
-    if epsilons:
-        plt.figure(figsize=(8, 4))
-        plt.plot(np.arange(len(epsilons)), epsilons, label="Epsilon", color="tab:orange")
-        plt.xlabel("Batch step")
-        plt.ylabel("Epsilon")
-        plt.title("Exploration schedule")
-        plt.grid(True)
-        plot_path = Path(output_dir) / "plots" / "epsilon_curve.png"
-        _save_plot(plot_path)
-        output_paths["epsilon_curve"] = str(plot_path)
-
-    return output_paths
-
-
-def plot_evaluation_results(records: Iterable[HandRecord], output_dir: str | Path) -> Dict[str, str]:
-    records = list(records)
-    output_paths: Dict[str, str] = {}
-    if not records:
-        return output_paths
-
-    indices = [r.index for r in records]
-    bankroll = [r.bankroll_after for r in records]
-    deltas = [r.delta for r in records]
-    bets = [r.bet for r in records]
-    true_counts = [r.true_count for r in records]
-    actions = [r.action for r in records]
-    decks_remaining = [r.decks_remaining for r in records]
-
-    plt.figure(figsize=(8, 4))
+def _generate_plots(
+    records: Sequence[HandDecision],
+    output_dir: Path,
+    action_frequencies: Dict[str, float],
+    bet_by_true_count: Dict[str, float],
+    outcome_by_true_count: Dict[str, float],
+) -> Dict[str, str]:
+    plots: Dict[str, str] = {}
+    indices = list(range(len(records)))
+    bankroll = [record.bankroll_after for record in records]
+    plt.figure(figsize=(10, 4))
     plt.plot(indices, bankroll, label="Bankroll")
     plt.xlabel("Hand index")
-    plt.ylabel("Bankroll ($)")
+    plt.ylabel("Bankroll")
     plt.title("Bankroll trajectory")
     plt.grid(True)
-    path = Path(output_dir) / "plots" / "bankroll_curve.png"
+    path = output_dir / "plots" / "bankroll_curve.png"
     _save_plot(path)
-    output_paths["bankroll_curve"] = str(path)
+    plots["bankroll_curve"] = str(path)
 
     plt.figure(figsize=(8, 4))
-    plt.hist(deltas, bins=30, color="tab:blue", alpha=0.7)
-    plt.xlabel("Hand return ($)")
+    labels = list(action_frequencies.keys())
+    values = [action_frequencies[label] for label in labels]
+    plt.bar(labels, values, color="tab:blue")
     plt.ylabel("Frequency")
-    plt.title("Distribution of hand returns")
-    path = Path(output_dir) / "plots" / "hand_return_hist.png"
+    plt.title("Action distribution")
+    plt.grid(True, axis="y", alpha=0.3)
+    path = output_dir / "plots" / "action_frequencies.png"
     _save_plot(path)
-    output_paths["hand_return_hist"] = str(path)
+    plots["action_frequencies"] = str(path)
 
-    plt.figure(figsize=(8, 4))
-    count_buckets = np.round(true_counts).astype(int)
-    unique_buckets = sorted(set(count_buckets))
-    action_map: Dict[str, List[int]] = {action: [] for action in set(actions)}
-    for bucket, action in zip(count_buckets, actions):
-        action_map.setdefault(action, []).append(bucket)
-    for action, bucket_values in action_map.items():
-        counts = [bucket_values.count(bucket) for bucket in unique_buckets]
-        plt.plot(unique_buckets, counts, label=action)
-    plt.xlabel("True count bucket")
-    plt.ylabel("Action usage")
-    plt.title("Action usage by true count")
-    plt.legend()
-    plt.grid(True)
-    path = Path(output_dir) / "plots" / "action_vs_true_count.png"
-    _save_plot(path)
-    output_paths["action_vs_true_count"] = str(path)
+    if bet_by_true_count:
+        plt.figure(figsize=(8, 4))
+        labels = list(bet_by_true_count.keys())
+        values = [bet_by_true_count[label] for label in labels]
+        plt.bar(labels, values, color="tab:green")
+        plt.ylabel("Average bet")
+        plt.xlabel("True count bin")
+        plt.title("Bet size vs. true count")
+        plt.grid(True, axis="y", alpha=0.3)
+        path = output_dir / "plots" / "bet_vs_true_count.png"
+        _save_plot(path)
+        plots["bet_vs_true_count"] = str(path)
 
-    plt.figure(figsize=(8, 4))
-    plt.scatter(true_counts, bets, alpha=0.6)
-    plt.xlabel("True count")
-    plt.ylabel("Bet size ($)")
-    plt.title("Bet size vs true count")
-    plt.grid(True)
-    path = Path(output_dir) / "plots" / "bet_vs_true_count.png"
-    _save_plot(path)
-    output_paths["bet_vs_true_count"] = str(path)
+    if outcome_by_true_count:
+        plt.figure(figsize=(8, 4))
+        labels = list(outcome_by_true_count.keys())
+        values = [outcome_by_true_count[label] for label in labels]
+        plt.bar(labels, values, color="tab:red")
+        plt.ylabel("EV per hand")
+        plt.xlabel("True count bin")
+        plt.title("Outcome by true count")
+        plt.grid(True, axis="y", alpha=0.3)
+        path = output_dir / "plots" / "outcome_by_true_count.png"
+        _save_plot(path)
+        plots["outcome_by_true_count"] = str(path)
 
-    plt.figure(figsize=(8, 4))
-    plt.scatter(decks_remaining, bets, alpha=0.6, c=np.arange(len(bets)), cmap="viridis")
-    plt.xlabel("Decks remaining")
-    plt.ylabel("Bet size ($)")
-    plt.title("Shoe penetration vs bet aggressiveness")
-    plt.grid(True)
-    path = Path(output_dir) / "plots" / "penetration_vs_bet.png"
-    _save_plot(path)
-    output_paths["penetration_vs_bet"] = str(path)
-
-    return output_paths
+    return plots
 
 
-def save_hand_records(records: Iterable[HandRecord], path: str | Path) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = [
-        "index",
-        "bankroll_before",
-        "bankroll_after",
-        "bet",
-        "delta",
-        "reward",
-        "outcome",
-        "true_count",
-        "running_count",
-        "action",
-        "decks_remaining",
-    ]
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(",".join(header) + "\n")
-        for record in records:
-            handle.write(",".join(str(getattr(record, field)) for field in header) + "\n")
+def _summarise_llm(
+    metrics: EvaluationMetrics,
+    deviations: List[str],
+    negative_q_patterns: List[str],
+    training_history: Optional[Dict[str, Sequence[float]]] = None,
+) -> str:
+    lines = []
+    lines.append("Blackjack RL Evaluation Summary")
+    lines.append("=" * 36)
+    lines.append(
+        f"EV/100 hands: {metrics.ev_per_100:.3f} (95% CI {metrics.ev_confidence[0]:.3f} – {metrics.ev_confidence[1]:.3f})"
+    )
+    lines.append(
+        f"Win/Loss/Push rates: {metrics.win_rate:.2%} / {metrics.loss_rate:.2%} / {metrics.push_rate:.2%}"
+    )
+    lines.append(f"Bust rate: {metrics.bust_rate:.2%}")
+    if metrics.baselines:
+        lines.append("Baseline EV/100:")
+        for name, data in metrics.baselines.items():
+            lines.append(f"  {name}: {data.get('ev_per_100', 0.0):.3f}")
+    lines.append("Bet curve vs true count:")
+    for bin_label, value in metrics.bet_by_true_count.items():
+        lines.append(f"  TC {bin_label}: avg bet {value:.2f}")
+    if deviations:
+        lines.append("Strategy deviations at high counts:")
+        for deviation in deviations[:5]:
+            lines.append(f"  - {deviation}")
+    if negative_q_patterns:
+        lines.append("States with low Q-values:")
+        for pattern in negative_q_patterns[:5]:
+            lines.append(f"  - {pattern}")
+    if training_history:
+        losses = training_history.get("loss_play_history", [])
+        if losses:
+            lines.append(
+                f"Training stability: play loss range {min(losses):.4f} – {max(losses):.4f}"
+            )
+    return "\n".join(lines)
 
 
-def compare_to_baseline(
+def _compute_negative_q_patterns(records: Sequence[HandDecision]) -> List[str]:
+    patterns: List[Tuple[float, str]] = []
+    for record in records:
+        for action in record.play_actions:
+            q_values = action.get("q_values")
+            if not q_values:
+                continue
+            max_q = max(q_values)
+            description = f"Hand {record.hand_id} {action.get('action')} with obs hash {hash(tuple(action.get('observation', [])))}"
+            patterns.append((max_q, description))
+    patterns.sort(key=lambda item: item[0])
+    return [desc for _val, desc in patterns[:5]]
+
+
+def _evaluate_policy(
+    policy: EvaluationPolicy, env_config: BlackjackEnvConfig, num_hands: int
+) -> Dict[str, float]:
+    env = BlackjackEnv(dataclasses.replace(env_config, reward_shaping=False))
+    obs, info = env.reset()
+    hands = 0
+    total_profit = 0.0
+    while hands < num_hands:
+        action = policy.act(env, obs, info)
+        obs, reward, done, info = env.step(action)
+        total_profit += reward
+        if info.get("hand_complete"):
+            hands += 1
+        if done:
+            obs, info = env.reset()
+    ev_per_100 = (total_profit / max(1, hands)) * 100.0
+    return {"ev_per_100": ev_per_100}
+
+
+def evaluate_agent(
+    agent: RainbowDQNAgent,
     env_config: BlackjackEnvConfig,
-    trained_agent: DQNAgent,
-    num_hands: int = 2_000,
+    num_hands: int,
+    output_dir: str | Path,
+    *,
+    training_history: Optional[Dict[str, Sequence[float]]] = None,
 ) -> Dict[str, object]:
-    """Evaluate trained agent versus the deterministic baseline."""
+    output_path = _timestamp_dir(output_dir)
+    env = BlackjackEnv(dataclasses.replace(env_config, reward_shaping=False))
+    records: List[HandDecision] = []
+    action_counter: Counter[str] = Counter()
+    bet_bins: Dict[str, List[float]] = defaultdict(list)
+    outcome_bins: Dict[str, List[float]] = defaultdict(list)
+    deviations: List[str] = []
 
-    def dqn_action(obs: np.ndarray, legal_actions: Sequence[int], info: Dict[str, float | str], env: BlackjackEnv) -> int:
-        mask = legal_mask_from_info({"legal_actions": legal_actions}, trained_agent.config.num_actions)
-        actions = trained_agent.greedy_actions(obs[None, :], mask[None, :])
-        return int(actions[0])
+    logger = DecisionLogger(
+        output_path / "logs" / "decisions.jsonl", output_path / "logs" / "decisions.csv"
+    )
 
-    def basic_action(_: np.ndarray, __: Sequence[int], ___: Dict[str, float | str], env: BlackjackEnv) -> int:
-        baseline = BasicStrategyAgent()
-        return baseline.select_action(env)
+    obs, info = env.reset()
+    active_records: Dict[int, HandDecision] = {}
+    bankroll_after_last = env.bankroll
+    hands_played = 0
 
-    trained_results = evaluate_policy(env_config, dqn_action, num_hands=num_hands)
-    baseline_results = evaluate_policy(env_config, basic_action, num_hands=num_hands)
+    while hands_played < num_hands:
+        if info.get("needs_bet", info.get("phase") == "bet"):
+            q_bet, _ = agent.evaluate_q(np.expand_dims(obs, axis=0))
+            action = agent.select_actions(
+                np.expand_dims(obs, axis=0), [info], deterministic=True
+            )[0]
+            bankroll_before = env.bankroll
+            obs, reward, done, info = env.step(action)
+            info_for_hand = info
+            hand_id = int(info_for_hand.get("hand_id", env.current_hand_index))
+            record = _prepare_hand_record(
+                env, info_for_hand, action, q_bet[0], bankroll_before
+            )
+            active_records[hand_id] = record
+            bet_bins[_bin_true_count(record.true_count)].append(record.bet_amount)
+            continue
 
-    gain = trained_results["summary"].expected_value - baseline_results["summary"].expected_value
+        _, q_play = agent.evaluate_q(np.expand_dims(obs, axis=0))
+        mask = np.asarray(info.get("action_mask"), dtype=np.float32)
+        action = agent.select_actions(
+            np.expand_dims(obs, axis=0), [info], deterministic=True
+        )[0]
+        obs_next, reward, done, info_next = env.step(action)
+        hand_id = int(info.get("hand_id", env.current_hand_index))
+        record = active_records.setdefault(
+            hand_id, _prepare_hand_record(env, info, -1, [], env.bankroll)
+        )
+        record.play_actions.append(
+            {
+                "action": env.action_names.get(action, str(action)),
+                "q_values": q_play[0].tolist(),
+                "mask": mask.tolist(),
+                "observation": obs.tolist(),
+            }
+        )
+        action_counter[env.action_names.get(action, str(action))] += 1
+        deviation = _collect_deviation(action, env, info)
+        if deviation:
+            deviations.append(deviation)
+        if info_next.get("hand_complete"):
+            record.outcome = str(info_next.get("outcome", ""))
+            record.profit = float(info_next.get("delta", reward))
+            record.bankroll_after = float(info_next.get("bankroll", env.bankroll))
+            record.final_dealer_total = int(info_next.get("dealer_total", 0))
+            record.final_player_total = int(info_next.get("player_total", 0))
+            logger.log(record)
+            records.append(record)
+            outcome_bins[_bin_true_count(record.true_count)].append(record.profit)
+            bankroll_after_last = record.bankroll_after
+            active_records.pop(hand_id, None)
+            hands_played += 1
+        obs = obs_next
+        info = info_next if not done else info_next.get("reset_info", info_next)
+        if done:
+            obs, info = env.reset()
+
+    logger.close()
+
+    profits = [record.profit for record in records]
+    ev_per_hand = np.mean(profits) if profits else 0.0
+    ev_per_100 = ev_per_hand * 100.0
+    ci_low, ci_high = _compute_confidence_interval([p * 100.0 for p in profits])
+    wins = sum(1 for p in profits if p > 0)
+    pushes = sum(1 for p in profits if math.isclose(p, 0.0, abs_tol=1e-6))
+    losses = len(profits) - wins - pushes
+    total_hands = len(profits)
+    win_rate = wins / total_hands if total_hands else 0.0
+    push_rate = pushes / total_hands if total_hands else 0.0
+    loss_rate = losses / total_hands if total_hands else 0.0
+    bust_rate = 1.0 if bankroll_after_last <= env.config.bankroll_stop_loss else 0.0
+    action_frequencies = {
+        action: count / max(1, sum(action_counter.values()))
+        for action, count in action_counter.items()
+    }
+    bet_by_true_count = {
+        bin_label: float(np.mean(values)) for bin_label, values in bet_bins.items()
+    }
+    outcome_by_true_count = {
+        bin_label: float(np.mean(values)) for bin_label, values in outcome_bins.items()
+    }
+
+    baselines: Dict[str, Dict[str, float]] = {}
+    basic_policy = BasicStrategyPolicy(bet_index=0)
+    count_policy = CountBettingPolicy(
+        CountBettingSchedule(
+            thresholds=[1, 2, 3], bet_indices=[1, 3, env_config.bet_actions - 1]
+        )
+    )
+    baselines["basic_strategy"] = _evaluate_policy(
+        basic_policy, env_config, min(num_hands, 5_000)
+    )
+    baselines["basic_with_count"] = _evaluate_policy(
+        count_policy, env_config, min(num_hands, 5_000)
+    )
+
+    metrics = EvaluationMetrics(
+        ev_per_100=float(ev_per_100),
+        ev_confidence=(ci_low, ci_high),
+        win_rate=float(win_rate),
+        push_rate=float(push_rate),
+        loss_rate=float(loss_rate),
+        bust_rate=float(bust_rate),
+        total_hands=total_hands,
+        bankroll_change=float(bankroll_after_last - env.config.bankroll),
+        action_frequencies=action_frequencies,
+        bet_by_true_count=bet_by_true_count,
+        outcome_by_true_count=outcome_by_true_count,
+        baselines=baselines,
+    )
+
+    metrics_path = output_path / "metrics.json"
+    with metrics_path.open("w", encoding="utf-8") as handle:
+        json.dump(metrics.to_dict(), handle, indent=2)
+
+    plots = _generate_plots(
+        records,
+        output_path,
+        action_frequencies,
+        bet_by_true_count,
+        outcome_by_true_count,
+    )
+    negative_patterns = _compute_negative_q_patterns(records)
+    summary_text = _summarise_llm(
+        metrics, deviations, negative_patterns, training_history
+    )
+    summary_path = output_path / "summary_llm.txt"
+    summary_path.write_text(summary_text, encoding="utf-8")
 
     return {
-        "trained": trained_results,
-        "baseline": baseline_results,
-        "expected_value_gain": gain,
+        "metrics": metrics.to_dict(),
+        "plots": plots,
+        "records_path": str(output_path / "logs" / "decisions.jsonl"),
+        "summary_path": str(summary_path),
+        "run_dir": str(output_path),
     }
 
 
-__all__ = [
-    "HandRecord",
-    "EvaluationSummary",
-    "evaluate_policy",
-    "plot_training_curves",
-    "plot_evaluation_results",
-    "save_hand_records",
-    "compare_to_baseline",
-]
+__all__ = ["evaluate_agent"]
