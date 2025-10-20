@@ -57,21 +57,18 @@ def test_reward_function() -> TestResult:
     # Win scenario
     env.dealer_cards = [_make_card("9", 9), _make_card("7", 7)]
     player_hand = HandState(cards=[_make_card("10", 10), _make_card("8", 8)], bet=2.0)
-    env._dealer_play = lambda: (16, False)  # type: ignore[assignment]
     reward, info = env._resolve_hand(player_hand, outcome="stand")
     if not np.isclose(reward, 2.0):
         return TestResult("reward_win", False, f"expected 2.0, got {reward}")
     # Push
     env.dealer_cards = [_make_card("10", 10), _make_card("7", 7)]
     player_hand = HandState(cards=[_make_card("10", 10), _make_card("7", 7)], bet=2.0)
-    env._dealer_play = lambda: (17, False)  # type: ignore[assignment]
     reward, info = env._resolve_hand(player_hand, outcome="stand")
     if not np.isclose(reward, -0.1):
         return TestResult("reward_push", False, f"expected -0.1, got {reward}")
     # Doubled loss
     env.dealer_cards = [_make_card("10", 10), _make_card("9", 9)]
     player_hand = HandState(cards=[_make_card("10", 10), _make_card("6", 6)], bet=4.0)
-    env._dealer_play = lambda: (20, False)  # type: ignore[assignment]
     reward, info = env._resolve_hand(player_hand, outcome="stand")
     if not np.isclose(reward, -4.0):
         return TestResult("reward_loss", False, f"expected -4.0, got {reward}")
