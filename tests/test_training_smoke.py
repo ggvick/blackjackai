@@ -1,47 +1,25 @@
-from blackjackai_rl.agents import DQNConfig
-from blackjackai_rl.env import BlackjackEnvConfig
-from blackjackai_rl.training import train_rainbow
+import numpy as np
+from blackjack_env.env import BlackjackEnv, EnvConfig
+from agents.dqn_rainbow import AgentConfig, RainbowDQNAgent
 
 
-def test_training_smoke(tmp_path):
-    env_config = BlackjackEnvConfig(
-        num_decks=1,
-        penetration=0.5,
-        reward_shaping=False,
-        bankroll=50.0,
-        bankroll_target=100.0,
-        min_bet=1.0,
-        max_bet=2.0,
-        bet_actions=4,
-        seed=7,
-    )
-    agent_config = DQNConfig(
-        state_dim=36,
-        num_actions=5,
-        bet_actions=4,
-        hidden_sizes=(64, 64),
-        gamma=0.95,
-        lr=1e-3,
-        bet_lr=1e-3,
-        epsilon_decay=500,
-        batch_size=16,
-        buffer_size=1_000,
-        min_buffer_size=32,
-        target_update_interval=100,
-        prioritized_replay=True,
-        atoms=31,
-        v_min=-10.0,
-        v_max=10.0,
-        n_step=1,
+def test_training_smoke_runs():
+    env = BlackjackEnv(EnvConfig(seed=123, min_bet=1.0, max_bet=4.0, bet_levels=4))
+    env.reset()
+    config = AgentConfig(
+        observation_dim=env.observation_space.size,
+        bet_actions=env.config.bet_levels,
+        buffer_size=2048,
+        min_buffer_size=64,
+        batch_size=64,
+        target_update_interval=250,
+        enable_c51=False,
+        use_amp=False,
         device="cpu",
+        epsilon_decay=1000,
     )
-    results = train_rainbow(
-        env_config,
-        agent_config,
-        total_steps=200,
-        vector_envs=4,
-        log_interval=100,
-        output_dir=tmp_path,
-    )
-    assert results["reward_history"], "reward history should not be empty"
-    assert results["loss_play_history"], "loss history should be tracked"
+    agent = RainbowDQNAgent(config)
+    metrics = agent.train(env, steps=300)
+    assert "loss" in metrics
+    assert np.isfinite(metrics["loss"])
+    assert agent.global_step >= 300

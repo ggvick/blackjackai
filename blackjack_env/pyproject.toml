@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "blackjack-env"
+version = "0.1.0"
+description = "Blackjack environment for RL"
+authors = [{name = "BlackjackAI"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["numpy", "pandas", "torch", "matplotlib"]
