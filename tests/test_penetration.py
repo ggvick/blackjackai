@@ -1,20 +1,25 @@
-from blackjackai_rl.env import BlackjackEnv, BlackjackEnvConfig
+from blackjack_env.env import BlackjackEnv, EnvConfig
+from blackjack_env.masking import Action
+
+
+def run_round(env):
+    env.step({"bet": 0})
+    while env.state.stage == "play":
+        env.step(Action.STAND)
 
 
 def test_penetration_triggers_shuffle():
-    config = BlackjackEnvConfig(
-        num_decks=1, penetration=0.25, reward_shaping=False, seed=13
-    )
+    config = EnvConfig(num_decks=1, penetration=0.1, seed=5)
     env = BlackjackEnv(config)
     env.reset()
-    initial_shoe = env.shoe_id
-    cards_to_draw = int(env.total_cards * config.penetration) + 1
-    for _ in range(cards_to_draw):
-        env.draw_card()
-    # Shuffle is triggered lazily when the next round is about to start
-    obs, reward, done, info = env.step(0)
-    assert not done
-    assert reward == 0.0
-    assert env.shoe_id == initial_shoe + 1
-    # After reshuffle and initial deal we should only have the cards from the new hand drawn
-    assert env.cards_drawn == 4
+    initial_length = len(env.state.shoe)
+    reshuffled = False
+    for _ in range(10):
+        before = len(env.state.shoe)
+        run_round(env)
+        after = len(env.state.shoe)
+        if after > before:
+            reshuffled = True
+            break
+    assert reshuffled, "Expected shoe to reshuffle when penetration reached"
+    assert env.state.shoe_initial_count == initial_length
