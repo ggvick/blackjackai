@@ -1,30 +1,40 @@
 import numpy as np
 
-from blackjackai_rl.env import BlackjackEnv, BlackjackEnvConfig
+from blackjack_env.env import BlackjackEnv, EnvConfig
 
 
-def test_observation_phase_and_ranges():
-    config = BlackjackEnvConfig(reward_shaping=False, seed=99)
-    env = BlackjackEnv(config)
-    obs, info = env.reset()
+def set_cards(env, cards):
+    env.state.shoe = list(reversed(cards))
+    env.state.shoe_initial_count = len(env.state.shoe)
+    env.step({"bet": 0})
 
-    # Bet phase observation
-    assert np.allclose(obs[:10], 0.0)
-    assert obs[30] == 1.0  # phase bet indicator
-    assert obs[31] == 0.0
-    assert 0.0 <= obs[23] <= 1.0
-    assert obs[25] == 0.0
 
-    obs_play, _, _, info_play = env.step(0)
-    assert obs_play.shape[0] == env.observation_builder.observation_dim
-    assert np.isclose(obs_play[:10].sum(), 1.0)
-    assert 0.0 <= obs_play[10] <= 1.0
-    assert 0.0 <= obs_play[13] <= 1.0
-    assert -1.0 <= obs_play[14] <= 1.0
-    assert -1.0 <= obs_play[15] <= 1.0
-    assert 0.0 <= obs_play[16] <= 1.0
-    assert 0.0 <= obs_play[17] <= 1.0
-    assert 0.0 <= obs_play[25] <= 1.0
-    assert 0.0 <= obs_play[26] <= 1.0
-    assert obs_play[30] == 0.0
-    assert obs_play[31] == 1.0
+def test_observation_values():
+    env = BlackjackEnv(EnvConfig(num_decks=1, seed=21))
+    env.reset()
+    set_cards(env, [5, 10, 6, 9])
+    obs = env._current_observation()
+    space = env.observation_space
+    assert obs.shape[0] == space.size
+    assert np.isfinite(obs).all()
+
+    dealer_one_hot = obs[:10]
+    assert np.isclose(dealer_one_hot.sum(), 1.0)
+    assert dealer_one_hot.argmax() == 9  # dealer upcard 10
+
+    total_norm, is_soft, is_pair = obs[10:13]
+    assert 0 <= total_norm <= 1
+    assert is_soft == 0
+    assert is_pair == 0
+
+    true_count = obs[14]
+    running_count = obs[15]
+    decks_norm = obs[16]
+    penetration = obs[17]
+    assert -5 <= true_count <= 5
+    assert -5 <= running_count <= 5
+    assert 0 <= decks_norm <= 1
+    assert 0 <= penetration <= 1
+
+    last_action = obs[-5:]
+    assert np.allclose(last_action, 0)

@@ -1,11 +1,14 @@
-.PHONY: test lint format
+.PHONY: test lint format install
 
-test:
-	pytest -q
+install:
+pip install -e ./blackjack_env
 
 lint:
-	ruff check blackjackai_rl tests
-	black --check blackjackai_rl tests
+ruff check blackjack_env agents tests
+black --check blackjack_env agents tests
 
 format:
-	black blackjackai_rl tests
+black blackjack_env agents tests
+
+test:
+pytest -q
