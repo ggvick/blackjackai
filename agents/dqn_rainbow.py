@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from collections import deque
-from typing import Deque, Dict, Tuple
+from dataclasses import dataclass
+from typing import Deque, Dict, Iterable, Tuple
 
 import numpy as np
 import torch
@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from blackjack_env.masking import Action, apply_action_mask
 
 from .replay import PrioritizedReplayBuffer
+from .utils_device import get_device, require_cuda_or_explain
 
 
 class NoisyLinear(nn.Module):
@@ -31,7 +32,7 @@ class NoisyLinear(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        mu_range = 1 / np.sqrt(self.in_features)
+        mu_range = 1.0 / np.sqrt(self.in_features)
         self.weight_mu.data.uniform_(-mu_range, mu_range)
         self.bias_mu.data.uniform_(-mu_range, mu_range)
         self.weight_sigma.data.fill_(self.sigma0 / np.sqrt(self.in_features))
@@ -49,7 +50,6 @@ class NoisyLinear(nn.Module):
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         if self.training:
-            self.reset_noise()
             weight = self.weight_mu + self.weight_sigma * self.weight_eps
             bias = self.bias_mu + self.bias_sigma * self.bias_eps
         else:
@@ -64,12 +64,29 @@ def linear(in_features: int, out_features: int, use_noisy: bool) -> nn.Module:
     return nn.Linear(in_features, out_features)
 
 
-def mask_q(
-    q: torch.Tensor, legal_mask: torch.Tensor, neg_inf: float = float("-1e9")
-) -> torch.Tensor:
-    """Apply a legality mask to Q-values without in-place modification."""
+def mask_q(q: torch.Tensor, legal: torch.Tensor, neg_inf: float = float("-1e9")) -> torch.Tensor:
+    """Apply legality mask to Q-values without in-place modification."""
 
-    return q.masked_fill(~legal_mask, neg_inf)
+    return q.masked_fill(~legal, neg_inf)
+
+
+def normalize_probs(probs: torch.Tensor) -> torch.Tensor:
+    den = probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return (probs / den).clamp(1e-6, 1.0)
+
+
+def _to_device(batch: Dict[str, torch.Tensor | np.ndarray], device: torch.device) -> Dict[str, torch.Tensor]:
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in batch.items():
+        tensor: torch.Tensor
+        if isinstance(value, torch.Tensor):
+            tensor = value.to(device, non_blocking=True)
+        elif isinstance(value, np.ndarray):
+            tensor = torch.from_numpy(value).to(device)
+        else:
+            tensor = torch.as_tensor(value, device=device)
+        out[key] = tensor
+    return out
 
 
 @dataclass
@@ -77,92 +94,137 @@ class AgentConfig:
     observation_dim: int
     bet_actions: int
     play_actions: int = 5
-    atom_size: int = 51
-    v_min: float = -10.0
-    v_max: float = 10.0
-    gamma: float = 0.99
-    n_step: int = 3
+    hidden_sizes: Tuple[int, ...] = (1024, 1024)
+    lr: float = 3e-4
+    wd: float = 0.0
     buffer_size: int = 1_000_000
+    batch_size: int = 1024
     min_buffer_size: int = 20_000
-    batch_size: int = 512
-    lr: float = 1e-4
+    target_update_interval: int = 15_000
+    double_dqn: bool = True
+    dueling: bool = True
+    prioritized_replay: bool = True
     per_alpha: float = 0.6
-    per_beta: float = 0.4
-    per_beta_increment: float = 1e-6
-    epsilon_start: float = 1.0
-    epsilon_end: float = 0.05
-    epsilon_decay: int = 1_200_000
-    use_noisy: bool = False
-    target_update_interval: int = 15000
-    grad_clip: float = 5.0
-    device: str = "cpu"
-    use_amp: bool = True
+    per_beta_start: float = 0.4
+    per_beta_end: float = 1.0
+    per_beta_increment: float | None = None
+    per_beta_steps: int = 1_000_000
+    n_step: int = 3
     enable_c51: bool = True
+    num_atoms: int = 51
+    vmin: float = -20.0
+    vmax: float = 20.0
+    use_noisy: bool = True
+    epsilon_start: float = 0.0
+    epsilon_final: float = 0.0
+    epsilon_decay: int = 0
+    use_amp: bool = True
+    replay_on_gpu: bool = True
+    compile_model: bool = True
+    gamma: float = 0.99
     clip_reward: float = 5.0
     detect_anomaly: bool = False
+    grad_clip: float | None = 5.0
+    device: str | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.hidden_sizes, Iterable) and not isinstance(
+            self.hidden_sizes, tuple
+        ):
+            self.hidden_sizes = tuple(self.hidden_sizes)
+        if self.per_beta_increment is None:
+            steps = max(1, int(self.per_beta_steps))
+            self.per_beta_increment = (self.per_beta_end - self.per_beta_start) / steps
+        self.per_beta_increment = float(max(0.0, self.per_beta_increment))
+        self.num_atoms = int(self.num_atoms)
+        self.atom_size = self.num_atoms  # backward compatibility
 
 
 @dataclass
 class TrainConfig:
     steps: int = 2_000_000
-    eval_interval: int = 50_000
+    vector_envs: int = 64
     log_interval: int = 2000
+    eval_hands: int = 100_000
 
 
-class RainbowNetwork(nn.Module):
-    def __init__(self, config: AgentConfig):
+class RainbowNet(nn.Module):
+    def __init__(self, cfg: AgentConfig):
         super().__init__()
-        self.config = config
-        self.feature = nn.Sequential(
-            nn.Linear(config.observation_dim, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-        )
-        value_out = config.atom_size if config.enable_c51 else 1
-        advantage_out = (
-            (config.play_actions * config.atom_size)
-            if config.enable_c51
-            else config.play_actions
-        )
-        value_stream = [
-            linear(512, 512, config.use_noisy),
-            nn.ReLU(),
-            linear(512, value_out, config.use_noisy),
-        ]
-        advantage_stream = [
-            linear(512, 512, config.use_noisy),
-            nn.ReLU(),
-            linear(512, advantage_out, config.use_noisy),
-        ]
-        self.value_stream = nn.Sequential(*value_stream)
-        self.advantage_stream = nn.Sequential(*advantage_stream)
+        self.cfg = cfg
+        layers = []
+        in_dim = cfg.observation_dim
+        for hidden in cfg.hidden_sizes:
+            layers.append(linear(in_dim, hidden, cfg.use_noisy))
+            layers.append(nn.ReLU())
+            in_dim = hidden
+        self.feature = nn.Sequential(*layers) if layers else nn.Identity()
+        last_dim = in_dim if layers else cfg.observation_dim
+        stream_hidden = max(last_dim // 2, 1)
+        value_out = cfg.num_atoms if cfg.enable_c51 else 1
+        advantage_out = cfg.play_actions * (cfg.num_atoms if cfg.enable_c51 else 1)
+        if cfg.dueling:
+            self.value_stream = nn.Sequential(
+                linear(last_dim, stream_hidden, cfg.use_noisy),
+                nn.ReLU(),
+                linear(stream_hidden, value_out, cfg.use_noisy),
+            )
+            self.advantage_stream = nn.Sequential(
+                linear(last_dim, stream_hidden, cfg.use_noisy),
+                nn.ReLU(),
+                linear(stream_hidden, advantage_out, cfg.use_noisy),
+            )
+            self.q_stream = None
+        else:
+            self.value_stream = None
+            self.advantage_stream = None
+            self.q_stream = nn.Sequential(
+                linear(last_dim, stream_hidden, cfg.use_noisy),
+                nn.ReLU(),
+                linear(stream_hidden, advantage_out, cfg.use_noisy),
+            )
         self.bet_head = nn.Sequential(
-            linear(512, 256, config.use_noisy),
+            linear(last_dim, stream_hidden, cfg.use_noisy),
             nn.ReLU(),
-            linear(256, config.bet_actions, config.use_noisy),
+            linear(stream_hidden, cfg.bet_actions, cfg.use_noisy),
         )
-        self.atom_size = config.atom_size
-        self.play_actions = config.play_actions
-        self.enable_c51 = config.enable_c51
+        support = torch.linspace(cfg.vmin, cfg.vmax, cfg.num_atoms)
+        self.register_buffer("support", support)
+        self.enable_c51 = cfg.enable_c51
+        self.num_atoms = cfg.num_atoms
+        self.play_actions = cfg.play_actions
 
     def forward(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         features = self.feature(obs)
-        value = self.value_stream(features)
-        advantage = self.advantage_stream(features)
-        if self.enable_c51:
-            value = value.view(-1, 1, self.atom_size)
-            advantage = advantage.view(-1, self.play_actions, self.atom_size)
-            q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
-        else:
-            value = value.view(-1, 1)
-            advantage = advantage.view(-1, self.play_actions)
-            q_atoms = value + advantage - advantage.mean(dim=1, keepdim=True)
         bet_logits = self.bet_head(features)
-        return bet_logits, q_atoms
+        if self.cfg.dueling:
+            value = self.value_stream(features)
+            advantage = self.advantage_stream(features)
+            if self.enable_c51:
+                value = value.view(-1, 1, self.num_atoms)
+                advantage = advantage.view(-1, self.play_actions, self.num_atoms)
+            else:
+                value = value.view(-1, 1)
+                advantage = advantage.view(-1, self.play_actions)
+            q = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        else:
+            q = self.q_stream(features)
+            if self.enable_c51:
+                q = q.view(-1, self.play_actions, self.num_atoms)
+            else:
+                q = q.view(-1, self.play_actions)
+        return bet_logits, q
+
+    def play_Q(self, obs: torch.Tensor) -> torch.Tensor:
+        _, q = self.forward(obs)
+        if self.enable_c51:
+            probs = torch.softmax(q, dim=-1)
+            probs = normalize_probs(probs)
+            return (probs * self.support.view(1, 1, -1)).sum(dim=-1)
+        return q
 
     def reset_noise(self) -> None:
-        if not self.config.use_noisy:
+        if not self.cfg.use_noisy:
             return
         for module in self.modules():
             if isinstance(module, NoisyLinear):
@@ -172,52 +234,70 @@ class RainbowNetwork(nn.Module):
 class RainbowDQNAgent:
     """Encapsulates Rainbow DQN training logic."""
 
-    def __init__(self, config: AgentConfig):
-        self.config = config
-        self.device = torch.device(config.device)
+    def __init__(self, cfg: AgentConfig):
+        self.config = cfg
+        self.device = torch.device(cfg.device) if cfg.device else get_device()
+        require_cuda_or_explain()
         if self.config.detect_anomaly:
             torch.autograd.set_detect_anomaly(True)
         if self.config.use_noisy:
             self.config.epsilon_decay = 0
-        self.online_net = RainbowNetwork(config).to(self.device)
-        self.target_net = RainbowNetwork(config).to(self.device)
-        self.target_net.load_state_dict(self.online_net.state_dict())
-        self.optimizer = torch.optim.Adam(self.online_net.parameters(), lr=config.lr)
-        self.buffer = PrioritizedReplayBuffer(
-            config.buffer_size,
-            alpha=config.per_alpha,
-            beta=config.per_beta,
-            beta_increment=config.per_beta_increment,
+        self.online = RainbowNet(cfg).to(self.device)
+        self.target = RainbowNet(cfg).to(self.device)
+        self.target.load_state_dict(self.online.state_dict())
+        if self.config.compile_model and torch.__version__.startswith("2"):
+            self.online = torch.compile(self.online, mode="reduce-overhead")
+        self.optimizer = torch.optim.AdamW(
+            self.online.parameters(), lr=cfg.lr, weight_decay=cfg.wd
         )
-        self.n_step_buffer: Deque[Tuple] = deque(maxlen=config.n_step)
-        self.support = torch.linspace(
-            config.v_min, config.v_max, config.atom_size, device=self.device
-        )
-        self.delta_z = (config.v_max - config.v_min) / (config.atom_size - 1)
         self.global_step = 0
         self.amp_enabled = bool(self.config.use_amp and self.device.type == "cuda")
-        self.scaler = torch.amp.GradScaler(device="cuda", enabled=self.amp_enabled)
+        self.scaler = torch.amp.GradScaler(
+            device="cuda", enabled=self.amp_enabled
+        )
+        buffer_device = self.device if (cfg.replay_on_gpu and self.device.type == "cuda") else torch.device("cpu")
+        self.buffer = PrioritizedReplayBuffer(
+            capacity=cfg.buffer_size,
+            observation_dim=cfg.observation_dim,
+            action_dim=cfg.play_actions,
+            device=buffer_device,
+            alpha=cfg.per_alpha if cfg.prioritized_replay else 0.0,
+            beta_start=cfg.per_beta_start,
+            beta_end=cfg.per_beta_end,
+            beta_increment=cfg.per_beta_increment,
+            use_amp=self.amp_enabled,
+            replay_on_gpu=cfg.replay_on_gpu and self.device.type == "cuda",
+        )
+        self.n_step_buffer: Deque[Tuple] = deque(maxlen=cfg.n_step)
+        self.delta_z = (
+            (cfg.vmax - cfg.vmin) / (cfg.num_atoms - 1)
+            if cfg.enable_c51 and cfg.num_atoms > 1
+            else None
+        )
+        self.gamma_n = self.config.gamma ** self.config.n_step
         self._maybe_reset_noise()
 
     # ------------------------------------------------------------------
     def epsilon(self) -> float:
         if self.config.use_noisy:
             return 0.0
+        if self.config.epsilon_decay <= 0:
+            return self.config.epsilon_final
         fraction = min(self.global_step / self.config.epsilon_decay, 1.0)
         return self.config.epsilon_start + fraction * (
-            self.config.epsilon_end - self.config.epsilon_start
+            self.config.epsilon_final - self.config.epsilon_start
         )
 
     def _maybe_reset_noise(self) -> None:
         if self.config.use_noisy:
-            self.online_net.reset_noise()
-            self.target_net.reset_noise()
+            self.online.reset_noise()
+            self.target.reset_noise()
 
     def act_bet(self, observation: np.ndarray) -> int:
         obs = torch.from_numpy(observation).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
             self._maybe_reset_noise()
-            bet_logits, _ = self.online_net(obs)
+            bet_logits, _ = self.online(obs)
             bet_action = int(bet_logits.argmax(dim=-1).item())
         return bet_action
 
@@ -234,13 +314,7 @@ class RainbowDQNAgent:
         obs = torch.from_numpy(observation).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
             self._maybe_reset_noise()
-            _, q_atoms = self.online_net(obs)
-            if self.config.enable_c51:
-                probs = F.softmax(q_atoms, dim=-1)
-                q_values = (probs * self.support).sum(dim=-1)
-            else:
-                q_values = q_atoms
-            q_values = q_values.squeeze(0).cpu().numpy()
+            q_values = self.online.play_Q(obs).squeeze(0).cpu().numpy()
         masked_q = apply_action_mask(q_values, mask)
         action = int(masked_q.argmax())
         return action, q_values
@@ -313,124 +387,128 @@ class RainbowDQNAgent:
             self.n_step_buffer.clear()
 
     # ------------------------------------------------------------------
+    def _loss_from_batch(
+        self, batch: Dict[str, torch.Tensor], weights: torch.Tensor | None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        states = batch["states"].to(self.device)
+        next_states = batch["next_states"].to(self.device)
+        legal = batch["legal_mask"].to(self.device).bool()
+        legal_next = batch["legal_mask_next"].to(self.device).bool()
+        bet_actions = batch["bet_actions"].to(self.device).long()
+        actions = batch["actions"].to(self.device).long()
+        rewards = batch["rewards"].to(self.device, dtype=torch.float32)
+        dones = batch["dones"].to(self.device, dtype=torch.float32)
+
+        self._maybe_reset_noise()
+        bet_logits, play_outputs = self.online(states)
+        if self.config.enable_c51:
+            support_values = self.target.support.to(self.device)
+            support = support_values.view(1, 1, -1)
+            online_logits = play_outputs
+            log_probs = F.log_softmax(online_logits, dim=-1)
+            probs = normalize_probs(torch.softmax(online_logits, dim=-1))
+            q_expectation = (probs * support).sum(dim=-1)
+            q_masked = mask_q(q_expectation, legal)
+            q_sa = q_masked.gather(1, actions.unsqueeze(1)).squeeze(1)
+            with torch.no_grad():
+                next_online_logits = self.online(next_states)[1]
+                next_online_probs = normalize_probs(
+                    torch.softmax(next_online_logits, dim=-1)
+                )
+                q2o = mask_q((next_online_probs * support).sum(dim=-1), legal_next)
+                a2 = q2o.argmax(dim=1)
+                next_target_logits = self.target(next_states)[1]
+                target_probs_all = normalize_probs(
+                    torch.softmax(next_target_logits, dim=-1)
+                )
+                gather_index = a2.view(-1, 1, 1).expand(-1, 1, self.config.num_atoms)
+                target_probs = target_probs_all.gather(1, gather_index).squeeze(1)
+                tz = rewards.unsqueeze(-1) + self.gamma_n * (1.0 - dones.unsqueeze(-1)) * support_values.view(1, -1)
+                tz = tz.clamp(self.config.vmin, self.config.vmax)
+                b = (tz - self.config.vmin) / self.delta_z if self.delta_z else tz
+                l = b.floor()
+                u = b.ceil()
+                l_idx = l.clamp(0, self.config.num_atoms - 1).long()
+                u_idx = u.clamp(0, self.config.num_atoms - 1).long()
+                m = torch.zeros_like(target_probs)
+                m.scatter_add_(dim=-1, index=l_idx, src=target_probs * (u - b))
+                m.scatter_add_(dim=-1, index=u_idx, src=target_probs * (b - l))
+            action_log_probs = log_probs.gather(
+                1, actions.view(-1, 1, 1).expand(-1, 1, self.config.num_atoms)
+            ).squeeze(1)
+            q_loss = -(m * action_log_probs).sum(dim=-1)
+            bet_targets = (m * support_values.view(1, -1)).sum(dim=-1)
+        else:
+            q_values = play_outputs
+            q_masked = mask_q(q_values, legal)
+            q_sa = q_masked.gather(1, actions.unsqueeze(1)).squeeze(1)
+            with torch.no_grad():
+                q_next_online = mask_q(self.online.play_Q(next_states), legal_next)
+                a2 = q_next_online.argmax(dim=1)
+                q_next_target = mask_q(self.target.play_Q(next_states), legal_next)
+                q_next = q_next_target.gather(1, a2.unsqueeze(1)).squeeze(1)
+                bet_targets = rewards + self.gamma_n * (1.0 - dones) * q_next
+            q_loss = F.smooth_l1_loss(q_sa, bet_targets, reduction="none")
+
+        bet_pred = bet_logits.gather(1, bet_actions.unsqueeze(1)).squeeze(1)
+        bet_loss = F.mse_loss(bet_pred, bet_targets, reduction="none")
+        per_sample = q_loss + bet_loss
+        if weights is not None:
+            per_sample = per_sample * weights
+        loss = per_sample.mean()
+        td_error = (bet_targets - q_sa).abs()
+        return loss, per_sample.detach(), td_error.detach(), bet_targets.detach()
+
     def train_step(self) -> Dict[str, float]:
         if self.buffer.pos < self.config.min_buffer_size and not self.buffer.full:
+            self.global_step += 1
             return {"loss": 0.0}
-
-        transitions, indices, weights = self.buffer.sample(self.config.batch_size)
-        (
-            states,
-            masks,
-            bet_actions,
-            actions,
-            rewards,
-            next_states,
-            next_masks,
-            dones,
-        ) = zip(*transitions)
-
-        states_t = torch.as_tensor(np.stack(states), dtype=torch.float32, device=self.device)
-        next_states_t = torch.as_tensor(
-            np.stack(next_states), dtype=torch.float32, device=self.device
+        batch, indices, weights_np = self.buffer.sample(self.config.batch_size)
+        batch_t = _to_device(batch, self.device)
+        isw = (
+            torch.as_tensor(weights_np, device=self.device)
+            if weights_np is not None
+            else None
         )
-        rewards_t = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
-        dones_t = torch.as_tensor(dones, dtype=torch.float32, device=self.device)
-        bet_actions_t = torch.as_tensor(bet_actions, dtype=torch.long, device=self.device)
-        actions_t = torch.as_tensor(actions, dtype=torch.long, device=self.device)
-        legal_mask = torch.as_tensor(np.stack(masks), dtype=torch.bool, device=self.device)
-        legal_mask_next = torch.as_tensor(
-            np.stack(next_masks), dtype=torch.bool, device=self.device
-        )
-        is_weights = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
-        is_weights = is_weights.clamp_min(1e-3)
-        gamma_n = self.config.gamma**self.config.n_step
-
+        if isw is not None:
+            isw = isw.clamp_min(1e-3)
         self.optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(device_type="cuda", enabled=self.amp_enabled):
-            self._maybe_reset_noise()
-            bet_logits, play_outputs = self.online_net(states_t)
-
-            if self.config.enable_c51:
-                online_logits = play_outputs
-                log_probs = F.log_softmax(online_logits, dim=-1)
-                probs = F.softmax(online_logits, dim=-1)
-                support = self.support.view(1, 1, -1)
-                q_expectation = (probs * support).sum(dim=-1)
-                q_masked = mask_q(q_expectation, legal_mask)
-                q_sa = q_masked.gather(1, actions_t.unsqueeze(1)).squeeze(1)
-
-                with torch.no_grad():
-                    next_online_logits = self.online_net(next_states_t)[1]
-                    next_target_logits = self.target_net(next_states_t)[1]
-                    next_online_probs = F.softmax(next_online_logits, dim=-1)
-                    next_q_expectation = (next_online_probs * support).sum(dim=-1)
-                    next_q_masked = mask_q(next_q_expectation, legal_mask_next)
-                    next_actions = next_q_masked.argmax(dim=-1)
-                    target_all_probs = F.softmax(next_target_logits, dim=-1)
-                    gather_index = next_actions.view(-1, 1, 1).expand(
-                        -1, 1, self.config.atom_size
-                    )
-                    target_probs = target_all_probs.gather(1, gather_index).squeeze(1)
-                    tz = rewards_t.unsqueeze(-1) + gamma_n * (
-                        1.0 - dones_t.unsqueeze(-1)
-                    ) * self.support
-                    tz = tz.clamp(self.config.v_min, self.config.v_max)
-                    b = (tz - self.config.v_min) / self.delta_z
-                    l = b.floor()
-                    u = b.ceil()
-                    l_idx = l.clamp(0, self.config.atom_size - 1).long()
-                    u_idx = u.clamp(0, self.config.atom_size - 1).long()
-                    m = torch.zeros_like(target_probs)
-                    m.scatter_add_(dim=-1, index=l_idx, src=target_probs * (u - b))
-                    m.scatter_add_(dim=-1, index=u_idx, src=target_probs * (b - l))
-
-                action_log_probs = log_probs.gather(
-                    1,
-                    actions_t.view(-1, 1, 1).expand(-1, 1, self.config.atom_size),
-                ).squeeze(1)
-                q_loss = -(m * action_log_probs).sum(dim=-1)
-                bet_targets = (m * self.support).sum(dim=-1)
-            else:
-                q_values = play_outputs
-                q_masked = mask_q(q_values, legal_mask)
-                q_sa = q_masked.gather(1, actions_t.unsqueeze(1)).squeeze(1)
-
-                with torch.no_grad():
-                    next_q_online = mask_q(
-                        self.online_net(next_states_t)[1], legal_mask_next
-                    )
-                    next_actions = next_q_online.argmax(dim=1)
-                    next_q_target = mask_q(
-                        self.target_net(next_states_t)[1], legal_mask_next
-                    )
-                    q_next = next_q_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)
-                    bet_targets = rewards_t + gamma_n * (1.0 - dones_t) * q_next
-
-                q_loss = F.smooth_l1_loss(q_sa, bet_targets, reduction="none")
-
-            bet_pred = bet_logits.gather(1, bet_actions_t.unsqueeze(1)).squeeze(1)
-            bet_loss = F.mse_loss(bet_pred, bet_targets, reduction="none")
-            per_sample_loss = q_loss + bet_loss
-            per_sample_loss = per_sample_loss * is_weights
-            loss = per_sample_loss.mean()
-
+        with torch.amp.autocast(
+            device_type="cuda", enabled=self.amp_enabled
+        ):
+            loss, _, td_error, _ = self._loss_from_batch(batch_t, isw)
         self.scaler.scale(loss).backward()
         if self.config.grad_clip is not None:
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
-                self.online_net.parameters(), self.config.grad_clip
+                self.online.parameters(), self.config.grad_clip
             )
         self.scaler.step(self.optimizer)
         self.scaler.update()
-
-        td_error = (bet_targets - q_sa).abs().detach().cpu().numpy()
-        self.buffer.update_priorities(indices, td_error + 1e-6)
-
+        self.buffer.update_priorities(indices, td_error.abs().cpu().numpy() + 1e-6)
         if self.global_step % self.config.target_update_interval == 0:
-            self.target_net.load_state_dict(self.online_net.state_dict())
+            self.target.load_state_dict(self.online.state_dict())
+        self.global_step += 1
+        return {"loss": float(loss.detach())}
 
-        loss_value = loss.detach().item()
-        return {"loss": float(loss_value)}
+    # ------------------------------------------------------------------
+    def _debug_train_step_once(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        batch_t = _to_device(batch, self.device)
+        self.optimizer.zero_grad(set_to_none=True)
+        isw = batch_t.get("weights")
+        if isw is not None:
+            batch_t = {k: v for k, v in batch_t.items() if k != "weights"}
+            weights = isw.clamp_min(1e-3)
+        else:
+            weights = None
+        with torch.amp.autocast(
+            device_type="cuda", enabled=self.amp_enabled
+        ):
+            loss, _, _, _ = self._loss_from_batch(batch_t, weights)
+        self.scaler.scale(loss).backward()
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        return loss.detach()
 
     # ------------------------------------------------------------------
     def train(self, env, steps: int, callback=None) -> Dict[str, float]:
@@ -455,11 +533,13 @@ class RainbowDQNAgent:
                     continue
             action, q_values = self.act_play(observation, mask)
             next_obs, reward, done, info = env.step(action)
-            next_mask = info.get("mask", env.available_actions()) if not done else np.zeros(
-                self.config.play_actions, dtype=bool
+            next_mask = (
+                info.get("mask", env.available_actions())
+                if not done
+                else np.zeros(self.config.play_actions, dtype=bool)
             )
-            clipped_reward = np.clip(
-                reward, -self.config.clip_reward, self.config.clip_reward
+            clipped_reward = float(
+                np.clip(reward, -self.config.clip_reward, self.config.clip_reward)
             )
             self.store(
                 observation,
@@ -474,15 +554,16 @@ class RainbowDQNAgent:
             observation = next_obs
             mask = next_mask
             bet_action = info.get("bet", bet_action)
-            self.global_step += 1
             metrics = self.train_step()
             if done:
                 observation = env.reset()
                 mask = env.available_actions()
                 bet_action = self.act_bet(observation)
                 observation, _, done, info = env.step({"bet": bet_action})
-                mask = info.get("mask", env.available_actions()) if not done else np.zeros(
-                    self.config.play_actions, dtype=bool
+                mask = (
+                    info.get("mask", env.available_actions())
+                    if not done
+                    else np.zeros(self.config.play_actions, dtype=bool)
                 )
             if callback and step % 1000 == 0:
                 callback(step, metrics)
