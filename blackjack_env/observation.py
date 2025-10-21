@@ -56,13 +56,16 @@ def build_observation(
 
     tc = true_count(running_count, max(decks_remaining, 1e-8))
     decks_norm = normalize_feature(decks_remaining, 0.0, 8.0)
+    running_norm = float(np.clip(running_count / 50.0, -1.0, 1.0))
+    true_norm = float(np.clip(tc / 10.0, -1.0, 1.0))
+    penetration_norm = float(np.clip(penetration_progress, 0.0, 1.0))
     features.append(
         np.array(
             [
-                float(tc),
-                float(running_count),
+                true_norm,
+                running_norm,
                 float(decks_norm),
-                float(np.clip(penetration_progress, 0.0, 1.0)),
+                penetration_norm,
             ],
             dtype=np.float32,
         )
@@ -74,15 +77,20 @@ def build_observation(
         else 0.0
     )
     if expected > 0:
+        count_10_norm = float(np.clip(count_10 / expected, -3.0, 3.0))
+        count_a_norm = float(np.clip(count_a / expected, -3.0, 3.0))
         features.append(
-            np.array([count_10 / expected, count_a / expected], dtype=np.float32)
+            np.array([count_10_norm, count_a_norm], dtype=np.float32)
         )
     else:
         features.append(np.zeros(2, dtype=np.float32))
 
     features.append(last_action_one_hot(last_action))
-
-    return np.concatenate(features)
+    obs = np.concatenate(features).astype(np.float32)
+    x = np.asarray(obs, dtype=np.float32)
+    assert np.isfinite(x).all(), "NaN/Inf in obs"
+    assert (x != 0).any(), "Obs all zeros — check builder"
+    return x
 
 
 def observation_size() -> ObservationSpace:

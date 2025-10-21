@@ -25,7 +25,7 @@ def _run_training_step(device: str, use_amp: bool, enable_c51: bool) -> None:
         observation_dim=8,
         bet_actions=3,
         play_actions=4,
-        atom_size=11,
+        num_atoms=11,
         buffer_size=128,
         min_buffer_size=2,
         batch_size=2,
@@ -34,6 +34,8 @@ def _run_training_step(device: str, use_amp: bool, enable_c51: bool) -> None:
         use_amp=use_amp,
         enable_c51=enable_c51,
         use_noisy=False,
+        replay_on_gpu=False,
+        compile_model=False,
     )
     agent = RainbowDQNAgent(config)
     _populate_buffer(agent, transitions=8)

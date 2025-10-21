@@ -15,8 +15,10 @@ def test_training_smoke_runs():
         target_update_interval=250,
         enable_c51=False,
         use_amp=False,
-        device="cpu",
+        replay_on_gpu=False,
+        compile_model=False,
         epsilon_decay=1000,
+        device="cpu",
     )
     agent = RainbowDQNAgent(config)
     metrics = agent.train(env, steps=300)
