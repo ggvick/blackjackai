@@ -4,17 +4,32 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Dict, Iterable, Tuple
+from typing import Any, Deque, Dict, Iterable, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:  # PyTorch 2.4+
+    from torch.amp import GradScaler as _GradScaler  # type: ignore[attr-defined]
+    _GRAD_SCALER_SUPPORTS_DEVICE = True
+except ImportError:  # pragma: no cover - compatibility for older PyTorch
+    from torch.cuda.amp import GradScaler as _GradScaler  # type: ignore[attr-defined]
+    _GRAD_SCALER_SUPPORTS_DEVICE = False
+
+GradScaler = _GradScaler
+
 from blackjack_env.masking import Action, apply_action_mask
 
 from .replay import PrioritizedReplayBuffer
-from .utils_device import get_device, require_cuda_or_explain
+from .utils_device import get_device
+from .gpu_utils import (
+    autocast_if,
+    maybe_compile,
+    safe_state_dict_from_module,
+    strip_orig_mod_prefix,
+)
 
 
 class NoisyLinear(nn.Module):
@@ -237,24 +252,29 @@ class RainbowDQNAgent:
     def __init__(self, cfg: AgentConfig):
         self.config = cfg
         self.device = torch.device(cfg.device) if cfg.device else get_device()
-        require_cuda_or_explain()
+        if self.device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA device requested but not available. In Colab: Runtime → Change runtime type → GPU."
+            )
         if self.config.detect_anomaly:
             torch.autograd.set_detect_anomaly(True)
         if self.config.use_noisy:
             self.config.epsilon_decay = 0
         self.online = RainbowNet(cfg).to(self.device)
         self.target = RainbowNet(cfg).to(self.device)
-        self.target.load_state_dict(self.online.state_dict())
-        if self.config.compile_model and torch.__version__.startswith("2"):
-            self.online = torch.compile(self.online, mode="reduce-overhead")
+        self._sync_target_network()
+        compile_enabled = bool(self.config.compile_model)
+        self.online = maybe_compile(self.online, enabled=compile_enabled)
+        self._sync_target_network()
         self.optimizer = torch.optim.AdamW(
             self.online.parameters(), lr=cfg.lr, weight_decay=cfg.wd
         )
         self.global_step = 0
         self.amp_enabled = bool(self.config.use_amp and self.device.type == "cuda")
-        self.scaler = torch.amp.GradScaler(
-            device="cuda", enabled=self.amp_enabled
-        )
+        scaler_kwargs = {"enabled": self.amp_enabled}
+        if _GRAD_SCALER_SUPPORTS_DEVICE and self.device.type == "cuda":
+            scaler_kwargs["device"] = "cuda"
+        self.scaler = GradScaler(**scaler_kwargs)
         buffer_device = self.device if (cfg.replay_on_gpu and self.device.type == "cuda") else torch.device("cpu")
         self.buffer = PrioritizedReplayBuffer(
             capacity=cfg.buffer_size,
@@ -276,6 +296,11 @@ class RainbowDQNAgent:
         )
         self.gamma_n = self.config.gamma ** self.config.n_step
         self._maybe_reset_noise()
+
+    # ------------------------------------------------------------------
+    def _sync_target_network(self) -> None:
+        state = safe_state_dict_from_module(self.online)
+        self.target.load_state_dict(state)
 
     # ------------------------------------------------------------------
     def epsilon(self) -> float:
@@ -459,10 +484,10 @@ class RainbowDQNAgent:
         td_error = (bet_targets - q_sa).abs()
         return loss, per_sample.detach(), td_error.detach(), bet_targets.detach()
 
-    def train_step(self) -> Dict[str, float]:
+    def train_step(self) -> Dict[str, float | None]:
         if self.buffer.pos < self.config.min_buffer_size and not self.buffer.full:
             self.global_step += 1
-            return {"loss": 0.0}
+            return {"loss": None}
         batch, indices, weights_np = self.buffer.sample(self.config.batch_size)
         batch_t = _to_device(batch, self.device)
         isw = (
@@ -473,23 +498,30 @@ class RainbowDQNAgent:
         if isw is not None:
             isw = isw.clamp_min(1e-3)
         self.optimizer.zero_grad(set_to_none=True)
-        with torch.amp.autocast(
-            device_type="cuda", enabled=self.amp_enabled
-        ):
+        with autocast_if(self.amp_enabled):
             loss, _, td_error, _ = self._loss_from_batch(batch_t, isw)
-        self.scaler.scale(loss).backward()
-        if self.config.grad_clip is not None:
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.online.parameters(), self.config.grad_clip
-            )
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.amp_enabled:
+            self.scaler.scale(loss).backward()
+            if self.config.grad_clip is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.online.parameters(), self.config.grad_clip
+                )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.online.parameters(), self.config.grad_clip
+                )
+            self.optimizer.step()
         self.buffer.update_priorities(indices, td_error.abs().cpu().numpy() + 1e-6)
         if self.global_step % self.config.target_update_interval == 0:
-            self.target.load_state_dict(self.online.state_dict())
+            self._sync_target_network()
+        loss_value = float(loss.detach().cpu())
         self.global_step += 1
-        return {"loss": float(loss.detach())}
+        return {"loss": loss_value}
 
     # ------------------------------------------------------------------
     def _debug_train_step_once(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -501,18 +533,29 @@ class RainbowDQNAgent:
             weights = isw.clamp_min(1e-3)
         else:
             weights = None
-        with torch.amp.autocast(
-            device_type="cuda", enabled=self.amp_enabled
-        ):
+        with autocast_if(self.amp_enabled):
             loss, _, _, _ = self._loss_from_batch(batch_t, weights)
-        self.scaler.scale(loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        if self.amp_enabled:
+            self.scaler.scale(loss).backward()
+            if self.config.grad_clip is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.online.parameters(), self.config.grad_clip
+                )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            if self.config.grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.online.parameters(), self.config.grad_clip
+                )
+            self.optimizer.step()
         return loss.detach()
 
     # ------------------------------------------------------------------
-    def train(self, env, steps: int, callback=None) -> Dict[str, float]:
-        metrics = {"loss": 0.0}
+    def train(self, env, steps: int, callback=None) -> Dict[str, float | None]:
+        metrics = {"loss": None}
         observation = env.reset()
         mask = env.available_actions()
         bet_action = self.act_bet(observation)
@@ -568,3 +611,50 @@ class RainbowDQNAgent:
             if callback and step % 1000 == 0:
                 callback(step, metrics)
         return metrics
+
+    # ------------------------------------------------------------------
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return a state_dict that is safe for compiled models."""
+
+        return safe_state_dict_from_module(self.online)
+
+    # ------------------------------------------------------------------
+    def load_weights(self, state_dict: Dict[str, torch.Tensor], strict: bool = True) -> None:
+        """Load weights into the online and target networks safely."""
+
+        cleaned = strip_orig_mod_prefix(state_dict)
+        base_online = getattr(self.online, "_orig_mod", self.online)
+        base_online.load_state_dict(cleaned, strict=strict)
+        self.target.load_state_dict(cleaned, strict=strict)
+        self._maybe_reset_noise()
+
+    # ------------------------------------------------------------------
+    def load_checkpoint(self, payload: Dict[str, Any], strict: bool = True) -> None:
+        """Load a checkpoint payload with architecture safety checks."""
+
+        if not isinstance(payload, dict):
+            raise TypeError("Checkpoint payload must be a dictionary")
+        config_section = payload.get("config")
+        saved_agent_cfg: Dict[str, Any] = {}
+        if isinstance(config_section, dict):
+            agent_cfg = config_section.get("agent")
+            if isinstance(agent_cfg, dict):
+                saved_agent_cfg = agent_cfg
+        mismatches = []
+        for key in ("use_noisy", "enable_c51"):
+            if key in saved_agent_cfg and saved_agent_cfg[key] != getattr(self.config, key):
+                mismatches.append(key)
+        if mismatches:
+            raise RuntimeError(
+                "Checkpoint architecture mismatch: use_noisy/enable_c51 differ. "
+                "Recreate agent with matching flags."
+            )
+        state = payload.get("model", payload)
+        if not isinstance(state, dict):
+            raise TypeError("Checkpoint payload missing model state_dict")
+        self.load_weights(state, strict=strict)
+        if "step" in payload:
+            try:
+                self.global_step = int(payload["step"])
+            except (TypeError, ValueError):
+                pass
