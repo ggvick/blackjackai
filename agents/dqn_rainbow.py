@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Deque, Dict, Iterable, Tuple
@@ -27,9 +28,19 @@ from .utils_device import get_device
 from .gpu_utils import (
     autocast_if,
     maybe_compile,
-    safe_state_dict_from_module,
-    strip_orig_mod_prefix,
 )
+
+
+def _safe_state_dict_from_module(m: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    base = getattr(m, "_orig_mod", m)
+    return base.state_dict()
+
+
+def _strip_orig_mod_prefix(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    return {
+        (key[10:] if key.startswith("_orig_mod.") else key): value
+        for key, value in sd.items()
+    }
 
 
 class NoisyLinear(nn.Module):
@@ -251,7 +262,8 @@ class RainbowDQNAgent:
 
     def __init__(self, cfg: AgentConfig):
         self.config = cfg
-        self.device = torch.device(cfg.device) if cfg.device else get_device()
+        requested_device = torch.device(cfg.device) if cfg.device else get_device()
+        self.device = requested_device
         if self.device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(
                 "CUDA device requested but not available. In Colab: Runtime → Change runtime type → GPU."
@@ -262,12 +274,44 @@ class RainbowDQNAgent:
             self.config.epsilon_decay = 0
         self.online = RainbowNet(cfg).to(self.device)
         self.target = RainbowNet(cfg).to(self.device)
-        self._sync_target_network()
         compile_enabled = bool(self.config.compile_model)
         self.online = maybe_compile(self.online, enabled=compile_enabled)
+
+        candidates_online = [
+            "online_net",
+            "q_network",
+            "q_net",
+            "policy_net",
+            "network",
+            "net",
+            "online",
+        ]
+        candidates_target = [
+            "target_net",
+            "target_network",
+            "target_q_network",
+            "target",
+        ]
+
+        def _first_module(names):
+            for name in names:
+                module = getattr(self, name, None)
+                if isinstance(module, torch.nn.Module):
+                    return module
+            return None
+
+        self._online_ref = _first_module(candidates_online)
+        self._target_ref = _first_module(candidates_target)
+
+        if self._online_ref is None:
+            raise RuntimeError("RainbowDQNAgent: could not find an online network module")
+        if self._target_ref is None:
+            raise RuntimeError("RainbowDQNAgent: could not find a target network module")
+
+        self.device = next(self._online_ref.parameters()).device
         self._sync_target_network()
         self.optimizer = torch.optim.AdamW(
-            self.online.parameters(), lr=cfg.lr, weight_decay=cfg.wd
+            self.online_net.parameters(), lr=cfg.lr, weight_decay=cfg.wd
         )
         self.global_step = 0
         self.amp_enabled = bool(self.config.use_amp and self.device.type == "cuda")
@@ -297,6 +341,19 @@ class RainbowDQNAgent:
         self.gamma_n = self.config.gamma ** self.config.n_step
         self._maybe_reset_noise()
 
+    @property
+    def online_net(self) -> torch.nn.Module:
+        return self._online_ref
+
+    @property
+    def target_net(self) -> torch.nn.Module:
+        return self._target_ref
+
+    # ------------------------------------------------------------------
+    def _sync_target_network(self) -> None:
+        state = _safe_state_dict_from_module(self.online_net)
+        self.target_net.load_state_dict(state)
+
     # ------------------------------------------------------------------
     def _sync_target_network(self) -> None:
         state = safe_state_dict_from_module(self.online)
@@ -315,14 +372,14 @@ class RainbowDQNAgent:
 
     def _maybe_reset_noise(self) -> None:
         if self.config.use_noisy:
-            self.online.reset_noise()
-            self.target.reset_noise()
+            self.online_net.reset_noise()
+            self.target_net.reset_noise()
 
     def act_bet(self, observation: np.ndarray) -> int:
         obs = torch.from_numpy(observation).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
             self._maybe_reset_noise()
-            bet_logits, _ = self.online(obs)
+            bet_logits, _ = self.online_net(obs)
             bet_action = int(bet_logits.argmax(dim=-1).item())
         return bet_action
 
@@ -339,7 +396,7 @@ class RainbowDQNAgent:
         obs = torch.from_numpy(observation).float().unsqueeze(0).to(self.device)
         with torch.no_grad():
             self._maybe_reset_noise()
-            q_values = self.online.play_Q(obs).squeeze(0).cpu().numpy()
+            q_values = self.online_net.play_Q(obs).squeeze(0).cpu().numpy()
         masked_q = apply_action_mask(q_values, mask)
         action = int(masked_q.argmax())
         return action, q_values
@@ -425,9 +482,9 @@ class RainbowDQNAgent:
         dones = batch["dones"].to(self.device, dtype=torch.float32)
 
         self._maybe_reset_noise()
-        bet_logits, play_outputs = self.online(states)
+        bet_logits, play_outputs = self.online_net(states)
         if self.config.enable_c51:
-            support_values = self.target.support.to(self.device)
+            support_values = self.target_net.support.to(self.device)
             support = support_values.view(1, 1, -1)
             online_logits = play_outputs
             log_probs = F.log_softmax(online_logits, dim=-1)
@@ -436,13 +493,13 @@ class RainbowDQNAgent:
             q_masked = mask_q(q_expectation, legal)
             q_sa = q_masked.gather(1, actions.unsqueeze(1)).squeeze(1)
             with torch.no_grad():
-                next_online_logits = self.online(next_states)[1]
+                next_online_logits = self.online_net(next_states)[1]
                 next_online_probs = normalize_probs(
                     torch.softmax(next_online_logits, dim=-1)
                 )
                 q2o = mask_q((next_online_probs * support).sum(dim=-1), legal_next)
                 a2 = q2o.argmax(dim=1)
-                next_target_logits = self.target(next_states)[1]
+                next_target_logits = self.target_net(next_states)[1]
                 target_probs_all = normalize_probs(
                     torch.softmax(next_target_logits, dim=-1)
                 )
@@ -468,9 +525,9 @@ class RainbowDQNAgent:
             q_masked = mask_q(q_values, legal)
             q_sa = q_masked.gather(1, actions.unsqueeze(1)).squeeze(1)
             with torch.no_grad():
-                q_next_online = mask_q(self.online.play_Q(next_states), legal_next)
+                q_next_online = mask_q(self.online_net.play_Q(next_states), legal_next)
                 a2 = q_next_online.argmax(dim=1)
-                q_next_target = mask_q(self.target.play_Q(next_states), legal_next)
+                q_next_target = mask_q(self.target_net.play_Q(next_states), legal_next)
                 q_next = q_next_target.gather(1, a2.unsqueeze(1)).squeeze(1)
                 bet_targets = rewards + self.gamma_n * (1.0 - dones) * q_next
             q_loss = F.smooth_l1_loss(q_sa, bet_targets, reduction="none")
@@ -505,7 +562,7 @@ class RainbowDQNAgent:
             if self.config.grad_clip is not None:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    self.online.parameters(), self.config.grad_clip
+                    self.online_net.parameters(), self.config.grad_clip
                 )
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -513,7 +570,7 @@ class RainbowDQNAgent:
             loss.backward()
             if self.config.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
-                    self.online.parameters(), self.config.grad_clip
+                    self.online_net.parameters(), self.config.grad_clip
                 )
             self.optimizer.step()
         self.buffer.update_priorities(indices, td_error.abs().cpu().numpy() + 1e-6)
@@ -540,7 +597,7 @@ class RainbowDQNAgent:
             if self.config.grad_clip is not None:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(
-                    self.online.parameters(), self.config.grad_clip
+                    self.online_net.parameters(), self.config.grad_clip
                 )
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -548,7 +605,7 @@ class RainbowDQNAgent:
             loss.backward()
             if self.config.grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
-                    self.online.parameters(), self.config.grad_clip
+                    self.online_net.parameters(), self.config.grad_clip
                 )
             self.optimizer.step()
         return loss.detach()
@@ -613,48 +670,53 @@ class RainbowDQNAgent:
         return metrics
 
     # ------------------------------------------------------------------
-    def state_dict(self) -> Dict[str, torch.Tensor]:
-        """Return a state_dict that is safe for compiled models."""
-
-        return safe_state_dict_from_module(self.online)
-
-    # ------------------------------------------------------------------
-    def load_weights(self, state_dict: Dict[str, torch.Tensor], strict: bool = True) -> None:
-        """Load weights into the online and target networks safely."""
-
-        cleaned = strip_orig_mod_prefix(state_dict)
-        base_online = getattr(self.online, "_orig_mod", self.online)
-        base_online.load_state_dict(cleaned, strict=strict)
-        self.target.load_state_dict(cleaned, strict=strict)
-        self._maybe_reset_noise()
+    def save_checkpoint(
+        self, path: str | os.PathLike[str], extra: Dict[str, Any] | None = None
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "model": _safe_state_dict_from_module(self.online_net),
+            "config_agent": getattr(self, "config", None),
+            "extra": extra or {},
+            "step": getattr(self, "global_step", None),
+        }
+        torch.save(payload, path)
+        return payload
 
     # ------------------------------------------------------------------
-    def load_checkpoint(self, payload: Dict[str, Any], strict: bool = True) -> None:
-        """Load a checkpoint payload with architecture safety checks."""
-
-        if not isinstance(payload, dict):
-            raise TypeError("Checkpoint payload must be a dictionary")
-        config_section = payload.get("config")
-        saved_agent_cfg: Dict[str, Any] = {}
-        if isinstance(config_section, dict):
-            agent_cfg = config_section.get("agent")
-            if isinstance(agent_cfg, dict):
-                saved_agent_cfg = agent_cfg
-        mismatches = []
-        for key in ("use_noisy", "enable_c51"):
-            if key in saved_agent_cfg and saved_agent_cfg[key] != getattr(self.config, key):
-                mismatches.append(key)
-        if mismatches:
-            raise RuntimeError(
-                "Checkpoint architecture mismatch: use_noisy/enable_c51 differ. "
-                "Recreate agent with matching flags."
-            )
-        state = payload.get("model", payload)
-        if not isinstance(state, dict):
+    def load_checkpoint(
+        self,
+        path: str | os.PathLike[str],
+        strict: bool = True,
+        map_location: str | torch.device = "cpu",
+    ) -> Dict[str, Any]:
+        obj = torch.load(path, map_location=map_location)
+        if not isinstance(obj, dict):
+            raise TypeError("Checkpoint file must contain a dictionary payload")
+        state_obj = obj.get("model", obj)
+        if not isinstance(state_obj, dict):
             raise TypeError("Checkpoint payload missing model state_dict")
-        self.load_weights(state, strict=strict)
-        if "step" in payload:
-            try:
-                self.global_step = int(payload["step"])
-            except (TypeError, ValueError):
-                pass
+        cleaned_state = _strip_orig_mod_prefix(state_obj)
+        saved_cfg = obj.get("config_agent")
+        if saved_cfg is not None and hasattr(self, "config"):
+            for key in ("use_noisy", "enable_c51"):
+                if hasattr(self.config, key):
+                    current_val = getattr(self.config, key)
+                    if isinstance(saved_cfg, dict):
+                        saved_val = saved_cfg.get(key)
+                    else:
+                        saved_val = getattr(saved_cfg, key, None)
+                    if saved_val is not None and current_val is not None:
+                        if bool(saved_val) != bool(current_val):
+                            raise RuntimeError(
+                                f"Checkpoint mismatch: {key} differs between saved and current config."
+                            )
+        self.online_net.load_state_dict(cleaned_state, strict=strict)
+        try:
+            self.target_net.load_state_dict(cleaned_state, strict=strict)
+        except Exception:
+            pass
+        step_val = obj.get("step")
+        if isinstance(step_val, (int, float)):
+            self.global_step = int(step_val)
+        self._maybe_reset_noise()
+        return obj
