@@ -355,6 +355,11 @@ class RainbowDQNAgent:
         self.target_net.load_state_dict(state)
 
     # ------------------------------------------------------------------
+    def _sync_target_network(self) -> None:
+        state = safe_state_dict_from_module(self.online)
+        self.target.load_state_dict(state)
+
+    # ------------------------------------------------------------------
     def epsilon(self) -> float:
         if self.config.use_noisy:
             return 0.0
