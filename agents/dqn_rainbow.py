@@ -23,12 +23,9 @@ GradScaler = _GradScaler
 
 from blackjack_env.masking import Action, apply_action_mask
 
+from .gpu_utils import autocast_if, maybe_compile
 from .replay import PrioritizedReplayBuffer
 from .utils_device import get_device
-from .gpu_utils import (
-    autocast_if,
-    maybe_compile,
-)
 
 
 def _safe_state_dict_from_module(m: torch.nn.Module) -> Dict[str, torch.Tensor]:
@@ -268,6 +265,12 @@ class RainbowDQNAgent:
             raise RuntimeError(
                 "CUDA device requested but not available. In Colab: Runtime → Change runtime type → GPU."
             )
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except AttributeError:  # pragma: no cover - older torch
+                pass
         if self.config.detect_anomaly:
             torch.autograd.set_detect_anomaly(True)
         if self.config.use_noisy:
@@ -310,6 +313,8 @@ class RainbowDQNAgent:
 
         self.device = next(self._online_ref.parameters()).device
         self._sync_target_network()
+        self.target_net.eval()
+        self.online_net.train()
         self.optimizer = torch.optim.AdamW(
             self.online_net.parameters(), lr=cfg.lr, weight_decay=cfg.wd
         )
@@ -353,11 +358,7 @@ class RainbowDQNAgent:
     def _sync_target_network(self) -> None:
         state = _safe_state_dict_from_module(self.online_net)
         self.target_net.load_state_dict(state)
-
-    # ------------------------------------------------------------------
-    def _sync_target_network(self) -> None:
-        state = safe_state_dict_from_module(self.online)
-        self.target.load_state_dict(state)
+        self.target_net.eval()
 
     # ------------------------------------------------------------------
     def epsilon(self) -> float:
@@ -471,18 +472,29 @@ class RainbowDQNAgent:
     # ------------------------------------------------------------------
     def _loss_from_batch(
         self, batch: Dict[str, torch.Tensor], weights: torch.Tensor | None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        states = batch["states"].to(self.device)
-        next_states = batch["next_states"].to(self.device)
-        legal = batch["legal_mask"].to(self.device).bool()
-        legal_next = batch["legal_mask_next"].to(self.device).bool()
-        bet_actions = batch["bet_actions"].to(self.device).long()
-        actions = batch["actions"].to(self.device).long()
-        rewards = batch["rewards"].to(self.device, dtype=torch.float32)
-        dones = batch["dones"].to(self.device, dtype=torch.float32)
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Dict[str, torch.Tensor],
+    ]:
+        states = batch["states"].to(self.device, dtype=torch.float32, non_blocking=True)
+        next_states = batch["next_states"].to(
+            self.device, dtype=torch.float32, non_blocking=True
+        )
+        legal = batch["legal_mask"].to(self.device, non_blocking=True).bool()
+        legal_next = batch["legal_mask_next"].to(self.device, non_blocking=True).bool()
+        bet_actions = batch["bet_actions"].to(self.device, non_blocking=True).long()
+        actions = batch["actions"].to(self.device, non_blocking=True).long()
+        rewards = batch["rewards"].to(self.device, dtype=torch.float32, non_blocking=True)
+        dones = batch["dones"].to(self.device, dtype=torch.float32, non_blocking=True)
+
+        assert states.device == self.device, "states device mismatch"
+        assert next_states.device == self.device, "next_states device mismatch"
 
         self._maybe_reset_noise()
         bet_logits, play_outputs = self.online_net(states)
+        diagnostics: Dict[str, torch.Tensor] = {}
         if self.config.enable_c51:
             support_values = self.target_net.support.to(self.device)
             support = support_values.view(1, 1, -1)
@@ -515,11 +527,16 @@ class RainbowDQNAgent:
                 m = torch.zeros_like(target_probs)
                 m.scatter_add_(dim=-1, index=l_idx, src=target_probs * (u - b))
                 m.scatter_add_(dim=-1, index=u_idx, src=target_probs * (b - l))
+            m = normalize_probs(m)
             action_log_probs = log_probs.gather(
                 1, actions.view(-1, 1, 1).expand(-1, 1, self.config.num_atoms)
             ).squeeze(1)
             q_loss = -(m * action_log_probs).sum(dim=-1)
             bet_targets = (m * support_values.view(1, -1)).sum(dim=-1)
+            entropy = -(probs * log_probs).sum(dim=-1)
+            diagnostics["policy_entropy"] = entropy.mean()
+            diagnostics["q_mean"] = q_expectation.mean()
+            diagnostics["q_std"] = q_expectation.std(dim=-1, unbiased=False).mean()
         else:
             q_values = play_outputs
             q_masked = mask_q(q_values, legal)
@@ -531,6 +548,9 @@ class RainbowDQNAgent:
                 q_next = q_next_target.gather(1, a2.unsqueeze(1)).squeeze(1)
                 bet_targets = rewards + self.gamma_n * (1.0 - dones) * q_next
             q_loss = F.smooth_l1_loss(q_sa, bet_targets, reduction="none")
+            diagnostics["q_mean"] = q_sa.mean()
+            diagnostics["q_std"] = q_sa.std(unbiased=False)
+        diagnostics.setdefault("policy_entropy", torch.zeros(1, device=self.device))
 
         bet_pred = bet_logits.gather(1, bet_actions.unsqueeze(1)).squeeze(1)
         bet_loss = F.mse_loss(bet_pred, bet_targets, reduction="none")
@@ -539,12 +559,23 @@ class RainbowDQNAgent:
             per_sample = per_sample * weights
         loss = per_sample.mean()
         td_error = (bet_targets - q_sa).abs()
-        return loss, per_sample.detach(), td_error.detach(), bet_targets.detach()
+        diagnostics["td_error_mean"] = td_error.mean()
+        diagnostics["td_error_std"] = td_error.std(unbiased=False)
+        diagnostics["bet_target_mean"] = bet_targets.mean()
+        diagnostics["bet_pred_mean"] = bet_pred.mean()
+        return loss, per_sample.detach(), td_error.detach(), diagnostics
 
     def train_step(self) -> Dict[str, float | None]:
+        self.online_net.train()
+        self.target_net.eval()
         if self.buffer.pos < self.config.min_buffer_size and not self.buffer.full:
             self.global_step += 1
-            return {"loss": None}
+            warmup_fill = self.buffer.pos / float(self.buffer.capacity)
+            return {
+                "loss": None,
+                "replay_fill": warmup_fill,
+                "epsilon": self.epsilon(),
+            }
         batch, indices, weights_np = self.buffer.sample(self.config.batch_size)
         batch_t = _to_device(batch, self.device)
         isw = (
@@ -556,7 +587,7 @@ class RainbowDQNAgent:
             isw = isw.clamp_min(1e-3)
         self.optimizer.zero_grad(set_to_none=True)
         with autocast_if(self.amp_enabled):
-            loss, _, td_error, _ = self._loss_from_batch(batch_t, isw)
+            loss, _, td_error, diagnostics = self._loss_from_batch(batch_t, isw)
         if self.amp_enabled:
             self.scaler.scale(loss).backward()
             if self.config.grad_clip is not None:
@@ -578,7 +609,21 @@ class RainbowDQNAgent:
             self._sync_target_network()
         loss_value = float(loss.detach().cpu())
         self.global_step += 1
-        return {"loss": loss_value}
+        valid_entries = self.buffer.capacity if self.buffer.full else self.buffer.pos
+        replay_fill = valid_entries / float(self.buffer.capacity)
+        metrics: Dict[str, float | None] = {
+            "loss": loss_value,
+            "td_error": float(diagnostics["td_error_mean"].detach().cpu()),
+            "td_error_std": float(diagnostics["td_error_std"].detach().cpu()),
+            "q_mean": float(diagnostics["q_mean"].detach().cpu()),
+            "q_std": float(diagnostics["q_std"].detach().cpu()),
+            "policy_entropy": float(diagnostics["policy_entropy"].detach().cpu()),
+            "bet_target_mean": float(diagnostics["bet_target_mean"].detach().cpu()),
+            "bet_pred_mean": float(diagnostics["bet_pred_mean"].detach().cpu()),
+            "replay_fill": replay_fill,
+            "epsilon": self.epsilon(),
+        }
+        return metrics
 
     # ------------------------------------------------------------------
     def _debug_train_step_once(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
